@@ -50,7 +50,7 @@ warn() {
 WORK=""
 
 cleanup() {
-    stop_ssh_agent
+    stop_ssh
 
     if [[ -n "$WORK" ]]; then
         rm -rf -- "$WORK"
@@ -73,7 +73,7 @@ check() {
         return
     fi
 
-    if ! ssh "${SSH_OPTS[@]}" "$ROUTER" "$CMD" \
+    if ! router_ssh "$ROUTER" "$CMD" \
         > "$WORK/current" 2> "$WORK/error"; then
 
         fail "$NAME: could not collect $LABEL"
@@ -120,9 +120,7 @@ verify_router() {
 
     echo "[1/8] SSH connectivity"
 
-    if ssh "${SSH_OPTS[@]}" \
-        -o BatchMode=yes \
-        "$ROUTER" true 2>/dev/null; then
+    if open_ssh_master "$ROUTER" 2>/dev/null; then
 
         pass "$NAME: SSH connectivity"
     else
@@ -174,11 +172,11 @@ echo "Baseline directory: $BASELINE"
     exit 1
 }
 
-start_ssh_agent
+start_ssh
 
 WORK="$(mktemp -d)"
 
-for ROUTER in "${ROUTERS[@]}"; do
+for ROUTER in "${ROUTER_ADDRS[@]}"; do
     verify_router "$ROUTER" "$(router_name "$ROUTER")"
 done
 

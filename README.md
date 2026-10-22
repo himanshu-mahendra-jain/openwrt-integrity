@@ -4,7 +4,7 @@ Scripts to create known-good baselines and verify the integrity of OpenWrt route
 
 The baseline script records system information, critical file hashes, installed packages, UID 0 accounts, SSH authorized keys, overlay changes, and cron configuration. The verifier compares the current router state against that baseline and reports differences.
 
-Multiple routers are supported, using an SSH key with `ssh-agent` authentication.
+Multiple routers are supported, each logging in with its own SSH key, a running `ssh-agent`, or a password.
 
 ## Requirements
 
@@ -16,19 +16,19 @@ Multiple routers are supported, using an SSH key with `ssh-agent` authentication
 
 ## Configuration
 
-Both scripts read their settings from `routers.conf` and share their remote commands through `routers-common.sh`. Routers are defined in the `ROUTERS` array; the addresses below are examples, so change them to match the routers being monitored:
+Both scripts read their settings from `routers.conf` and share their remote commands through `routers-common.sh`. Each entry in the `ROUTERS` array sets one router's address and how to log in to it: `key <private key>`, `agent [public key]`, or `password`; the entries below are examples, so change them to match the routers being monitored:
 
 ```bash
 ROUTERS=(
-    "root@192.168.1.1"
-    "root@192.168.1.2"
-    "root@192.168.1.3"
+    "root@192.168.1.1 key $HOME/.ssh/openwrt"
+    "root@192.168.1.2 agent $HOME/.ssh/openwrt-office.pub"
+    "root@192.168.1.3 password"
 )
 ```
 
-Each router's baseline directory is named after its address (e.g. `root@192.168.1.1`), so routers can be added, removed, or reordered freely.
+Each router's baseline directory is named after its address (e.g. `root@192.168.1.1`), so routers can be added, removed, or reordered freely, and their login method changed without regenerating the baseline. Write key paths with `$HOME`, as `~` is not expanded inside the quotes.
 
-The SSH private key is set by `SSH_KEY` (default `~/.ssh/openwrt`). An `ssh-agent` is started on each run and the key is loaded with `ssh-add`, so the passphrase is entered only once per execution; the agent is stopped when the script exits. Connections use `-o IdentitiesOnly=yes` to ensure this key is used, and time out if a router stops responding.
+Keys are loaded into an `ssh-agent` started for the run, so each passphrase is entered once even when several routers share a key; `-o IdentitiesOnly=yes` ensures a router is offered only its own key. Agent routers use the agent already running in your session (`SSH_AUTH_SOCK`), such as one holding a hardware or password-manager key: any key in it, or only the one matching the public key given. A password is asked for once per router. Each router gets one master SSH connection that all its commands reuse; it is closed, and the agent stopped, when the script exits. Connections time out if a router stops responding. Password routers need someone at the terminal, so use keys without a passphrase, or an agent reachable from the job, for cron or other unattended runs.
 
 ## Generate a Baseline
 

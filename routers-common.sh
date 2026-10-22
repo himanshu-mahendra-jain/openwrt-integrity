@@ -13,11 +13,54 @@ source "$(dirname "${BASH_SOURCE[0]}")/routers.conf"
     exit 1
 }
 
+config_error() {
+    echo "ERROR: routers.conf entry $1: \"$2\""
+    echo "$3"
+    echo "Expected \"<user@address> key <private key>\","
+    echo "\"<user@address> agent [public key]\", or \"<user@address> password\"."
+    exit 1
+}
+
+# Each entry is split into its address and authentication. The
+# key path is the rest of the entry, so it may contain spaces;
+# for agent routers it is optional.
+ROUTER_ADDRS=()
+declare -A ROUTER_AUTH=()
+declare -A ROUTER_KEY=()
+declare -A ROUTER_NUM=()
+
+for I in "${!ROUTERS[@]}"; do
+    read -r ADDR AUTH KEY <<< "${ROUTERS[$I]}"
+
+    case "${AUTH:-}" in
+        key)
+            [[ -n "$KEY" ]] ||
+                config_error "$((I + 1))" "${ROUTERS[$I]}" "No private key given."
+            ;;
+        agent) ;;
+        password)
+            [[ -z "$KEY" ]] ||
+                config_error "$((I + 1))" "${ROUTERS[$I]}" "Password entries take no key."
+            ;;
+        "")
+            config_error "$((I + 1))" "${ROUTERS[$I]}" "No authentication method given."
+            ;;
+        *)
+            config_error "$((I + 1))" "${ROUTERS[$I]}" "Unknown authentication method: $AUTH"
+            ;;
+    esac
+
+    ROUTER_ADDRS+=("$ADDR")
+    ROUTER_AUTH["$ADDR"]="$AUTH"
+    ROUTER_KEY["$ADDR"]="$KEY"
+    ROUTER_NUM["$ADDR"]="$I"
+done
+
+unset I ADDR AUTH KEY
+
 # The keepalive options abort a session that stops responding
 # mid-command instead of hanging indefinitely.
 SSH_OPTS=(
-    -i "$SSH_KEY"
-    -o IdentitiesOnly=yes
     -o ConnectTimeout=10
     -o ServerAliveInterval=5
     -o ServerAliveCountMax=3
@@ -31,7 +74,7 @@ router_name() {
 }
 
 DUPLICATE_NAMES="$(
-    for ROUTER in "${ROUTERS[@]}"; do
+    for ROUTER in "${ROUTER_ADDRS[@]}"; do
         router_name "$ROUTER"
     done | sort | uniq -d
 )"
@@ -43,28 +86,145 @@ DUPLICATE_NAMES="$(
 }
 
 # ------------------------------------------------------------
-# SSH agent
+# SSH agent and master connections
 # ------------------------------------------------------------
 OWN_SSH_AGENT=0
+SSH_SOCKETS=""
 
-start_ssh_agent() {
-    [[ -f "$SSH_KEY" ]] || {
-        echo "ERROR: SSH key not found: $SSH_KEY"
+# The user's agent, used by agent routers. The agent this script
+# starts for key routers replaces SSH_AUTH_SOCK, so each ssh call
+# is given the right one.
+USER_AGENT="${SSH_AUTH_SOCK:-}"
+OWN_AGENT=""
+
+# Every key is loaded once, so routers sharing a key ask for
+# its passphrase only once per run.
+start_ssh() {
+    local ROUTER KEY
+    local KEYS=() MISSING=()
+    local USES_AGENT=0
+    declare -A SEEN=()
+
+    for ROUTER in "${ROUTER_ADDRS[@]}"; do
+        KEY="${ROUTER_KEY[$ROUTER]}"
+
+        [[ "${ROUTER_AUTH[$ROUTER]}" == agent ]] && USES_AGENT=1
+
+        [[ -n "$KEY" && -z "${SEEN[$KEY]:-}" ]] || continue
+        SEEN["$KEY"]=1
+
+        if [[ ! -f "$KEY" ]]; then
+            MISSING+=("$KEY")
+        elif [[ "${ROUTER_AUTH[$ROUTER]}" == key ]]; then
+            KEYS+=("$KEY")
+        fi
+    done
+
+    (( ${#MISSING[@]} == 0 )) || {
+        echo "ERROR: SSH key not found:"
+        printf '  %s\n' "${MISSING[@]}"
         exit 1
     }
 
+    if (( USES_AGENT )) && [[ ! -S "$USER_AGENT" ]]; then
+        echo "ERROR: Routers set to \"agent\" need a running ssh-agent,"
+        echo "but SSH_AUTH_SOCK does not point to one."
+        exit 1
+    fi
+
+    # Created in the system temp directory, as socket paths are
+    # limited to about 100 characters.
+    SSH_SOCKETS="$(mktemp -d)"
+
+    (( ${#KEYS[@]} > 0 )) || return 0
+
     eval "$(ssh-agent -s)" > /dev/null
     OWN_SSH_AGENT=1
-    ssh-add "$SSH_KEY"
+    OWN_AGENT="$SSH_AUTH_SOCK"
+
+    for KEY in "${KEYS[@]}"; do
+        ssh-add "$KEY"
+    done
 }
 
-# Only stops the agent started by this script, never an
-# agent inherited from the user's environment.
-stop_ssh_agent() {
+# Closes the master connections and stops the agent. Only an
+# agent started by this script is stopped, never one inherited
+# from the user's environment.
+stop_ssh() {
+    local ROUTER
+
+    if [[ -n "$SSH_SOCKETS" ]]; then
+        for ROUTER in "${ROUTER_ADDRS[@]}"; do
+            set_router_opts "$ROUTER"
+            SSH_AUTH_SOCK="$ROUTER_AGENT" \
+                ssh "${SSH_OPTS[@]}" "${ROUTER_OPTS[@]}" -O exit "$ROUTER" \
+                > /dev/null 2>&1 || true
+        done
+
+        rm -rf -- "$SSH_SOCKETS"
+        SSH_SOCKETS=""
+    fi
+
     if (( OWN_SSH_AGENT )); then
         ssh-agent -k > /dev/null 2>&1 || true
         OWN_SSH_AGENT=0
     fi
+}
+
+# Sets ROUTER_OPTS to the router's own options and ROUTER_AGENT
+# to its agent socket. ControlPath lets every command reuse one
+# master connection per router, so a password is asked for only
+# once. Each router has its own socket, even when ~/.ssh/config
+# aliases point several entries at one host. The authentication
+# options are passed on every call, so if the master connection
+# is lost a new connection still authenticates the right way.
+set_router_opts() {
+    local KEY="${ROUTER_KEY[$1]}"
+
+    ROUTER_OPTS=(-o ControlPath="$SSH_SOCKETS/${ROUTER_NUM[$1]}")
+    ROUTER_AGENT="${SSH_AUTH_SOCK:-}"
+
+    case "${ROUTER_AUTH[$1]}" in
+        key)
+            ROUTER_OPTS+=(-i "$KEY" -o IdentitiesOnly=yes)
+            ROUTER_AGENT="$OWN_AGENT"
+            ;;
+        agent)
+            # A public key limits ssh to that one agent key.
+            if [[ -n "$KEY" ]]; then
+                ROUTER_OPTS+=(-i "$KEY" -o IdentitiesOnly=yes)
+            fi
+            ROUTER_AGENT="$USER_AGENT"
+            ;;
+        password)
+            ROUTER_OPTS+=(-o PubkeyAuthentication=no)
+            ;;
+    esac
+}
+
+# Runs a command on a router: router_ssh <router> <command>
+router_ssh() {
+    local ROUTER="$1"
+    shift
+
+    set_router_opts "$ROUTER"
+    SSH_AUTH_SOCK="$ROUTER_AGENT" \
+        ssh "${SSH_OPTS[@]}" "${ROUTER_OPTS[@]}" "$ROUTER" "$@"
+}
+
+# Opens the master connection that later commands to the router
+# reuse. Batch mode stops key and agent authentication from
+# falling back to a password prompt; for password routers, ssh
+# prompts on the terminal even when output is redirected.
+open_ssh_master() {
+    set_router_opts "$1"
+
+    if [[ "${ROUTER_AUTH[$1]}" != password ]]; then
+        ROUTER_OPTS+=(-o BatchMode=yes)
+    fi
+
+    SSH_AUTH_SOCK="$ROUTER_AGENT" \
+        ssh "${SSH_OPTS[@]}" "${ROUTER_OPTS[@]}" -fNM "$1"
 }
 
 # ------------------------------------------------------------

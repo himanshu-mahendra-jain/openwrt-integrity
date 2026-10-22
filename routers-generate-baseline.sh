@@ -42,7 +42,7 @@ error() {
 WORK=""
 
 cleanup() {
-    stop_ssh_agent
+    stop_ssh
 
     if [[ -n "$WORK" ]]; then
         rm -rf -- "$WORK"
@@ -57,7 +57,7 @@ collect() {
     local OUT="$3"
     local LABEL="$4"
 
-    ssh "${SSH_OPTS[@]}" "$ROUTER" "$CMD" > "$OUT" ||
+    router_ssh "$ROUTER" "$CMD" > "$OUT" ||
         error "Could not collect $LABEL from $ROUTER."
 
     if grep -q '^ERROR  ' "$OUT"; then
@@ -79,6 +79,9 @@ generate_baseline() {
     echo " Baseline: $BASELINE/$NAME"
     echo "========================================"
     echo
+
+    open_ssh_master "$ROUTER" ||
+        error "Could not connect to $ROUTER."
 
     echo "[1/7] System information"
     collect "$ROUTER" "$REMOTE_SYSTEM" "$DIR/system.txt" "system information"
@@ -131,14 +134,14 @@ if [[ -e "$BASELINE" ]] && (( ! FORCE )); then
 Use --force to replace it. The old baseline will be kept as a backup."
 fi
 
-start_ssh_agent
+start_ssh
 
 # Build the new baseline in a temporary directory so a failure
 # never leaves a partial or overwritten baseline behind.
 mkdir -p "$(dirname "$BASELINE")"
 WORK="$(mktemp -d "$BASELINE.new.XXXXXX")"
 
-for ROUTER in "${ROUTERS[@]}"; do
+for ROUTER in "${ROUTER_ADDRS[@]}"; do
     generate_baseline "$ROUTER" "$(router_name "$ROUTER")"
 done
 
